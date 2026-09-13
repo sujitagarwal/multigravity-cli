@@ -193,9 +193,17 @@ create_profile_layout() {
   case "$(platform)" in
     darwin)
       mkdir -p "$profile_path/Library/Application Support"
+      mkdir -p "$profile_path/Library/Keychains"
 
-      if [ ! -e "$profile_path/Library/Keychains" ] && [ -d "$HOME/Library/Keychains" ]; then
-        ln -s "$HOME/Library/Keychains" "$profile_path/Library/Keychains"
+      # Create an isolated keychain for this profile so that OAuth tokens
+      # (stored by the language_server via go-keyring) do not leak between
+      # profiles.  An empty-password keychain is fine — macOS will unlock it
+      # automatically for the owning user.
+      local kc="$profile_path/Library/Keychains/login.keychain-db"
+      if [ ! -f "$kc" ]; then
+        security create-keychain -p "" "$kc" 2>/dev/null || true
+        # Disable auto-lock so background LS can always write tokens
+        security set-keychain-settings "$kc" 2>/dev/null || true
       fi
       ;;
     linux)
@@ -245,8 +253,12 @@ create_shared_layout() {
   case "$(platform)" in
     darwin)
       mkdir -p "$profile_path/Library/Application Support"
-      if [ ! -e "$profile_path/Library/Keychains" ] && [ -d "$HOME/Library/Keychains" ]; then
-        ln -s "$HOME/Library/Keychains" "$profile_path/Library/Keychains"
+      mkdir -p "$profile_path/Library/Keychains"
+      # Isolated keychain — see create_profile_layout().
+      local kc="$profile_path/Library/Keychains/login.keychain-db"
+      if [ ! -f "$kc" ]; then
+        security create-keychain -p "" "$kc" 2>/dev/null || true
+        security set-keychain-settings "$kc" 2>/dev/null || true
       fi
       ;;
     linux)
@@ -438,12 +450,83 @@ launch_profile() {
 
   print_info "Launching Antigravity profile '$profile'"
 
+  # --- macOS keychain isolation ---
+  # The language_server stores OAuth tokens via go-keyring in the macOS
+  # Keychain.  To isolate accounts between profiles we give each profile
+  # its own keychain file and make it the default before launching.
+  if [ "$(platform)" = "darwin" ]; then
+    local kc_dir="$profile_path/Library/Keychains"
+    local kc="$kc_dir/login.keychain-db"
+
+    # Migrate: replace legacy symlink with a real per-profile keychain
+    if [ -L "$kc_dir" ]; then
+      rm "$kc_dir"
+      mkdir -p "$kc_dir"
+      print_info "Migrated profile '$profile': replaced shared Keychains symlink with isolated keychain"
+    fi
+    if [ -L "$kc" ]; then
+      rm "$kc"
+    fi
+
+    # Create the keychain if it doesn't exist yet
+    if [ ! -f "$kc" ]; then
+      mkdir -p "$kc_dir"
+      security create-keychain -p "" "$kc" 2>/dev/null || true
+      security set-keychain-settings "$kc" 2>/dev/null || true
+    fi
+
+    # Unlock and temporarily make this profile's keychain the default so
+    # go-keyring writes new tokens here instead of the shared login keychain.
+    security unlock-keychain -p "" "$kc" 2>/dev/null || true
+    security default-keychain -s "$kc" 2>/dev/null || true
+
+    # Ensure it's in the search list (keep login keychain for other apps)
+    local login_kc
+    login_kc="$HOME/Library/Keychains/login.keychain-db"
+    security list-keychains -d user -s "$kc" "$login_kc" 2>/dev/null || true
+  fi
+
   case "$(platform)" in
     darwin)
-      HOME="$profile_path" open -n "$app" --args \
-        --user-data-dir "$data_dir" \
-        --extensions-dir "$ext_dir" \
-        "$@"
+      if [ "${MULTIGRAVITY_LEGACY_LAUNCH-}" = "1" ]; then
+        # Legacy mode: use 'open' via Launch Services. Note that HOME will NOT
+        # be inherited by the launched app in this mode — account isolation
+        # will not work correctly.
+        HOME="$profile_path" open -n "$app" --args \
+          --user-data-dir "$data_dir" \
+          --extensions-dir "$ext_dir" \
+          "$@"
+      else
+        # Default: launch the binary directly so HOME is properly inherited.
+        # This is required for account isolation because the app resolves
+        # os.homedir() to read auth tokens from ~/.gemini/.
+        #
+        # IMPORTANT: Antigravity's languageServer.js uses shellEnvSync() from
+        # the 'shell-env' npm package. That function spawns a login shell with
+        # a CLEAN env (only 3 hardcoded vars), so macOS resolves HOME from
+        # Directory Services — overwriting our HOME override. The resulting
+        # env is then spread OVER process.env, clobbering our HOME.
+        #
+        # Workaround: write a .zshenv inside the profile directory that
+        # re-exports HOME. When shellEnvSync() launches `zsh -ilc env` with
+        # HOME pointing at the profile dir, zsh sources $HOME/.zshenv first,
+        # which re-asserts the correct HOME before `env` runs.
+        local zshenv_file="$profile_path/.zshenv"
+        if [ ! -f "$zshenv_file" ] || ! grep -q "MULTIGRAVITY_MANAGED" "$zshenv_file" 2>/dev/null; then
+          cat > "$zshenv_file" <<ZSHENV
+# MULTIGRAVITY_MANAGED — do not edit; regenerated on each launch
+export HOME="$profile_path"
+ZSHENV
+        fi
+
+        local exe
+        exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist" 2>/dev/null || echo Antigravity)"
+        HOME="$profile_path" "$exe" \
+          --user-data-dir "$data_dir" \
+          --extensions-dir "$ext_dir" \
+          "$@" &
+        disown
+      fi
       ;;
     linux)
       HOME="$profile_path" \
@@ -457,6 +540,14 @@ launch_profile() {
         "$@"
       ;;
   esac
+
+  # Restore the login keychain as default so a normal (non-multigravity)
+  # Antigravity launch still works.  The profile keychain remains in the
+  # search list, so the running language_server can still find and update
+  # its tokens via SecItemCopyMatching / SecItemUpdate.
+  if [ "$(platform)" = "darwin" ] && [ "${MULTIGRAVITY_LEGACY_LAUNCH-}" != "1" ]; then
+    security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+  fi
 }
 
 list_profiles() {
@@ -659,6 +750,31 @@ doctor_cli() {
     fi
   else
     echo "  [!] Profile storage: $BASE (Not yet created)"
+  fi
+
+  # 6. Keychain isolation check (macOS only)
+  if [ "$(platform)" = "darwin" ] && [ -d "$BASE" ]; then
+    local stale=0
+    local dir
+    for dir in "$BASE"/*; do
+      [ -d "$dir" ] || continue
+      [ "$(basename "$dir")" = ".templates" ] && continue
+      local pname
+      pname="$(basename "$dir")"
+      if [ -L "$dir/Library/Keychains" ]; then
+        stale=$((stale + 1))
+        echo "  [!] Profile '$pname': has legacy Keychains symlink → account isolation broken"
+        echo "      Fix: launch the profile once to auto-migrate, or run:"
+        echo "      rm \"$dir/Library/Keychains\""
+      elif [ ! -f "$dir/Library/Keychains/login.keychain-db" ]; then
+        stale=$((stale + 1))
+        echo "  [!] Profile '$pname': missing per-profile keychain → account isolation broken"
+        echo "      Fix: launch the profile once to auto-create it"
+      fi
+    done
+    if [ $stale -gt 0 ]; then
+      warnings=$((warnings + stale))
+    fi
   fi
 
   echo ""
@@ -998,6 +1114,8 @@ Profile names: alphanumeric and hyphens only (e.g. work, personal, test-1)
 Environment:
   MULTIGRAVITY_APP      Override the Antigravity app path or command
   MULTIGRAVITY_HOME     Override the profile storage directory
+  MULTIGRAVITY_LEGACY_LAUNCH=1  Use macOS Launch Services ('open') instead of
+                        direct binary execution (disables account isolation)
 EOF
 }
 
