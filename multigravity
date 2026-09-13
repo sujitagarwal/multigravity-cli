@@ -193,17 +193,9 @@ create_profile_layout() {
   case "$(platform)" in
     darwin)
       mkdir -p "$profile_path/Library/Application Support"
-      mkdir -p "$profile_path/Library/Keychains"
 
-      # Create an isolated keychain for this profile so that OAuth tokens
-      # (stored by the language_server via go-keyring) do not leak between
-      # profiles.  An empty-password keychain is fine — macOS will unlock it
-      # automatically for the owning user.
-      local kc="$profile_path/Library/Keychains/login.keychain-db"
-      if [ ! -f "$kc" ]; then
-        security create-keychain -p "" "$kc" 2>/dev/null || true
-        # Disable auto-lock so background LS can always write tokens
-        security set-keychain-settings "$kc" 2>/dev/null || true
+      if [ ! -e "$profile_path/Library/Keychains" ] && [ -d "$HOME/Library/Keychains" ]; then
+        ln -s "$HOME/Library/Keychains" "$profile_path/Library/Keychains"
       fi
       ;;
     linux)
@@ -253,12 +245,8 @@ create_shared_layout() {
   case "$(platform)" in
     darwin)
       mkdir -p "$profile_path/Library/Application Support"
-      mkdir -p "$profile_path/Library/Keychains"
-      # Isolated keychain — see create_profile_layout().
-      local kc="$profile_path/Library/Keychains/login.keychain-db"
-      if [ ! -f "$kc" ]; then
-        security create-keychain -p "" "$kc" 2>/dev/null || true
-        security set-keychain-settings "$kc" 2>/dev/null || true
+      if [ ! -e "$profile_path/Library/Keychains" ] && [ -d "$HOME/Library/Keychains" ]; then
+        ln -s "$HOME/Library/Keychains" "$profile_path/Library/Keychains"
       fi
       ;;
     linux)
@@ -428,6 +416,60 @@ remove_shortcut() {
   esac
 }
 
+# --- macOS credential sync for multi-account isolation ---
+# The language_server binary uses go-keyring to store OAuth tokens in the login
+# Keychain under fixed keys (service: "gemini", account: "antigravity").
+# We isolate accounts by syncing each profile's token to .auth_token and swapping
+# the active token in the Keychain whenever switching profiles, without altering
+# system keychain configurations.
+
+save_profile_auth() {
+  local profile="${1-}"
+  [ -z "$profile" ] && return 0
+  [ "$(platform)" != "darwin" ] && return 0
+
+  local pdir
+  pdir="$(profile_dir "$profile")"
+  [ -d "$pdir" ] || return 0
+
+  local cur_token
+  cur_token="$(security find-generic-password -s "gemini" -a "antigravity" -w 2>/dev/null || true)"
+  if [ -n "$cur_token" ]; then
+    echo "$cur_token" > "$pdir/.auth_token"
+    chmod 600 "$pdir/.auth_token"
+  fi
+}
+
+sync_profile_auth() {
+  local target_profile="$1"
+  [ "$(platform)" != "darwin" ] && return 0
+
+  local active_file="$BASE/.active_profile"
+  local prev_profile=""
+  [ -f "$active_file" ] && prev_profile="$(cat "$active_file" 2>/dev/null || true)"
+
+  # 1. If switching from another profile, capture its current token from Keychain
+  if [ -n "$prev_profile" ] && [ "$prev_profile" != "$target_profile" ]; then
+    save_profile_auth "$prev_profile"
+  fi
+
+  # 2. Load the target profile's token into the Keychain
+  local target_dir
+  target_dir="$(profile_dir "$target_profile")"
+  local token_file="$target_dir/.auth_token"
+
+  if [ -f "$token_file" ] && [ -s "$token_file" ]; then
+    local new_token
+    new_token="$(cat "$token_file")"
+    security add-generic-password -U -s "gemini" -a "antigravity" -w "$new_token" 2>/dev/null || true
+  elif [ -n "$prev_profile" ] && [ "$prev_profile" != "$target_profile" ]; then
+    # Fresh or unauthenticated profile: remove current credential so it starts clean
+    security delete-generic-password -s "gemini" -a "antigravity" 2>/dev/null || true
+  fi
+
+  echo "$target_profile" > "$active_file"
+}
+
 launch_profile() {
   local profile=$1
   shift || true
@@ -450,40 +492,31 @@ launch_profile() {
 
   print_info "Launching Antigravity profile '$profile'"
 
-  # --- macOS keychain isolation ---
-  # The language_server stores OAuth tokens via go-keyring in the macOS
-  # Keychain.  To isolate accounts between profiles we give each profile
-  # its own keychain file and make it the default before launching.
+  # --- macOS account isolation via credential sync ---
+  # The language_server stores OAuth tokens via go-keyring in the login Keychain
+  # under fixed keys (service: "gemini", account: "antigravity").
+  # Rather than altering global system keychain configuration (which breaks
+  # normal Antigravity launches and causes "keychain not found" errors),
+  # we keep the standard Library/Keychains symlink and swap the credentials
+  # per profile on launch.
   if [ "$(platform)" = "darwin" ]; then
     local kc_dir="$profile_path/Library/Keychains"
-    local kc="$kc_dir/login.keychain-db"
-
-    # Migrate: replace legacy symlink with a real per-profile keychain
-    if [ -L "$kc_dir" ]; then
-      rm "$kc_dir"
-      mkdir -p "$kc_dir"
-      print_info "Migrated profile '$profile': replaced shared Keychains symlink with isolated keychain"
+    if [ -d "$kc_dir" ] && [ ! -L "$kc_dir" ]; then
+      if [ ! -f "$profile_path/.auth_token" ]; then
+        local old_tok
+        old_tok="$(security find-generic-password -s "gemini" -a "antigravity" -w "$kc_dir/login.keychain-db" 2>/dev/null || true)"
+        if [ -n "$old_tok" ]; then
+          echo "$old_tok" > "$profile_path/.auth_token"
+          chmod 600 "$profile_path/.auth_token"
+        fi
+      fi
+      rm -rf "$kc_dir"
     fi
-    if [ -L "$kc" ]; then
-      rm "$kc"
-    fi
-
-    # Create the keychain if it doesn't exist yet
-    if [ ! -f "$kc" ]; then
-      mkdir -p "$kc_dir"
-      security create-keychain -p "" "$kc" 2>/dev/null || true
-      security set-keychain-settings "$kc" 2>/dev/null || true
+    if [ ! -e "$kc_dir" ] && [ -d "$HOME/Library/Keychains" ]; then
+      ln -s "$HOME/Library/Keychains" "$kc_dir"
     fi
 
-    # Unlock and temporarily make this profile's keychain the default so
-    # go-keyring writes new tokens here instead of the shared login keychain.
-    security unlock-keychain -p "" "$kc" 2>/dev/null || true
-    security default-keychain -s "$kc" 2>/dev/null || true
-
-    # Ensure it's in the search list (keep login keychain for other apps)
-    local login_kc
-    login_kc="$HOME/Library/Keychains/login.keychain-db"
-    security list-keychains -d user -s "$kc" "$login_kc" 2>/dev/null || true
+    sync_profile_auth "$profile"
   fi
 
   case "$(platform)" in
@@ -524,7 +557,7 @@ ZSHENV
         HOME="$profile_path" "$exe" \
           --user-data-dir "$data_dir" \
           --extensions-dir "$ext_dir" \
-          "$@" &
+          "$@" </dev/null >/dev/null 2>&1 &
         disown
       fi
       ;;
@@ -540,14 +573,6 @@ ZSHENV
         "$@"
       ;;
   esac
-
-  # Restore the login keychain as default so a normal (non-multigravity)
-  # Antigravity launch still works.  The profile keychain remains in the
-  # search list, so the running language_server can still find and update
-  # its tokens via SecItemCopyMatching / SecItemUpdate.
-  if [ "$(platform)" = "darwin" ] && [ "${MULTIGRAVITY_LEGACY_LAUNCH-}" != "1" ]; then
-    security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
-  fi
 }
 
 list_profiles() {
@@ -752,29 +777,20 @@ doctor_cli() {
     echo "  [!] Profile storage: $BASE (Not yet created)"
   fi
 
-  # 6. Keychain isolation check (macOS only)
+  # 6. Account isolation check (macOS only)
   if [ "$(platform)" = "darwin" ] && [ -d "$BASE" ]; then
-    local stale=0
     local dir
     for dir in "$BASE"/*; do
       [ -d "$dir" ] || continue
       [ "$(basename "$dir")" = ".templates" ] && continue
       local pname
       pname="$(basename "$dir")"
-      if [ -L "$dir/Library/Keychains" ]; then
-        stale=$((stale + 1))
-        echo "  [!] Profile '$pname': has legacy Keychains symlink → account isolation broken"
-        echo "      Fix: launch the profile once to auto-migrate, or run:"
-        echo "      rm \"$dir/Library/Keychains\""
-      elif [ ! -f "$dir/Library/Keychains/login.keychain-db" ]; then
-        stale=$((stale + 1))
-        echo "  [!] Profile '$pname': missing per-profile keychain → account isolation broken"
-        echo "      Fix: launch the profile once to auto-create it"
+      if [ -f "$dir/.auth_token" ]; then
+        echo "  [✓] Profile '$pname': isolated account token saved"
+      else
+        echo "  [i] Profile '$pname': no saved account token yet (will sync on first login/launch)"
       fi
     done
-    if [ $stale -gt 0 ]; then
-      warnings=$((warnings + stale))
-    fi
   fi
 
   echo ""
