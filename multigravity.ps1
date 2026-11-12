@@ -155,16 +155,27 @@ function Invoke-LaunchProfile {
 
     Write-Host "Launching Antigravity profile '$PROFILE'"
     
-    # Launch Antigravity with isolated USERPROFILE
-    $env:USERPROFILE = $PROFILE_DIR
-    $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
-    $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
-    
-    if ($ArgsToForward) {
-        Start-Process -FilePath $APP -ArgumentList $ArgsToForward
+    # Start-Process inherits this environment, but the shell must not keep it.
+    $originalUserProfile = $env:USERPROFILE
+    $originalAppData = $env:APPDATA
+    $originalLocalAppData = $env:LOCALAPPDATA
+
+    try {
+        $env:USERPROFILE = $PROFILE_DIR
+        $env:APPDATA = "$PROFILE_DIR\AppData\Roaming"
+        $env:LOCALAPPDATA = "$PROFILE_DIR\AppData\Local"
+
+        if ($ArgsToForward) {
+            Start-Process -FilePath $APP -ArgumentList $ArgsToForward
+        }
+        else {
+            Start-Process -FilePath $APP
+        }
     }
-    else {
-        Start-Process -FilePath $APP
+    finally {
+        $env:USERPROFILE = $originalUserProfile
+        $env:APPDATA = $originalAppData
+        $env:LOCALAPPDATA = $originalLocalAppData
     }
 }
 
